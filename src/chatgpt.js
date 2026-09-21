@@ -2308,6 +2308,22 @@ async function waitAndExtractImage(p, beforeState = { imageIds: [], largeImages:
 // onSubmitted (optional): called the instant the send is CONFIRMED (a new user turn / stop
 // button appeared), BEFORE the trailing settle wait. Callers use it to mark the prompt as
 // sent so a failure in the settle window is not retried into a duplicate submission.
+async function typeComposerText(p, text, options = {}) {
+  const normalized = String(text)
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n');
+  const parts = normalized.split('\n');
+
+  for (let i = 0; i < parts.length; i++) {
+    if (parts[i]) {
+      await p.keyboard.type(parts[i], options);
+    }
+    if (i < parts.length - 1) {
+      await p.keyboard.press('Shift+Enter');
+    }
+  }
+}
+
 async function typeAndSubmit(p, text, preserveAttachments = false, onSubmitted = null) {
   console.log('Typing prompt...');
   await dismissModals(p);
@@ -2324,7 +2340,7 @@ async function typeAndSubmit(p, text, preserveAttachments = false, onSubmitted =
     await textareaLocator.first().click();
     await p.keyboard.press(caretEndKey).catch(() => {});
     await p.waitForTimeout(300);
-    await p.keyboard.type(text, { delay: 10 });
+    await typeComposerText(p, text, { delay: 10 });
   } else {
     await textareaLocator.first().fill(text);
   }
@@ -2344,7 +2360,7 @@ async function typeAndSubmit(p, text, preserveAttachments = false, onSubmitted =
     await textareaLocator.first().click();
     await p.keyboard.press(caretEndKey).catch(() => {});
     await p.waitForTimeout(300);
-    await textareaLocator.first().pressSequentially(text, { delay: 10 });
+    await typeComposerText(p, text, { delay: 10 });
     await p.waitForTimeout(500);
   }
 
@@ -3968,6 +3984,7 @@ module.exports = {
   // regression shipped: it threw for every refusal, and `node --check` plus the whole suite
   // stayed green. A page double is enough — the throw happens long before any image work.
   _test: {
+    typeComposerText,
     imageOutcomePredicate,
     setThinkingMode,
     waitAndExtractImage,
