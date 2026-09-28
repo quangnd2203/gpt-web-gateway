@@ -1,22 +1,124 @@
 const { Router } = require('express');
 const { getContext, saveSession, maybeHideWebdriverOnPage } = require('../browser');
 const { resetPage } = require('../chatgpt');
+const { VISIBLE_COMPOSER_SELECTOR } = require('../lib/composer-selectors');
+const {
+  ACCOUNT_STORAGE_KEY,
+  accountStateSyncDecision,
+  encodeAccountStorageValue,
+  parseStoredAccount,
+} = require('../lib/workspace-state');
 
 const router = Router();
 
 let loginPage = null;
+let loginPagePromise = null;
+let loginState = 'active'; // 'active' | 'saving' | 'saved'
+let loginGeneration = 0;
+
+function activateLoginFlow() {
+  if (loginState === 'saving') return;
+  loginState = 'active';
+  loginGeneration++;
+}
+
+function loginPageUnavailable(res) {
+  res.status(409).json({ error: 'Login session is being saved or has already been saved' });
+  return true;
+}
 
 async function getLoginPage() {
+  if (loginState !== 'active') return null;
   if (loginPage && !loginPage.isClosed()) return loginPage;
-  const ctx = await getContext();
-  loginPage = await ctx.newPage();
-  await maybeHideWebdriverOnPage(loginPage);
-  await loginPage.goto('https://chatgpt.com', { waitUntil: 'domcontentloaded', timeout: 60000 });
-  return loginPage;
+  if (loginPagePromise) return loginPagePromise;
+  const generation = loginGeneration;
+  const creation = (async () => {
+    const ctx = await getContext();
+    const page = await ctx.newPage();
+    try {
+      await maybeHideWebdriverOnPage(page);
+      await page.goto('https://chatgpt.com', { waitUntil: 'domcontentloaded', timeout: 60000 });
+      if (generation !== loginGeneration || loginState !== 'active') {
+        await page.close().catch(() => {});
+        return null;
+      }
+      loginPage = page;
+      return page;
+    } catch (err) {
+      await page.close().catch(() => {});
+      throw err;
+    }
+  })();
+  loginPagePromise = creation;
+  try {
+    return await creation;
+  } finally {
+    if (loginPagePromise === creation) loginPagePromise = null;
+  }
+}
+
+async function readAccountState(page) {
+  const cookies = await page.context().cookies('https://chatgpt.com');
+  const accountCookie = cookies.find((cookie) => cookie.name === ACCOUNT_STORAGE_KEY);
+  if (!accountCookie || !accountCookie.value) return { cookieValue: null, storageValue: null };
+
+  const storageValue = await page.evaluate((key) => localStorage.getItem(key), ACCOUNT_STORAGE_KEY);
+  return { cookieValue: accountCookie.value, storageValue };
+}
+
+async function waitForStableComposer(page, { timeoutMs = 15000, settleMs = 750 } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const composer = await page.$(VISIBLE_COMPOSER_SELECTOR).catch(() => null);
+    if (composer) {
+      await page.waitForTimeout(settleMs);
+      const stillVisible = await page.$(VISIBLE_COMPOSER_SELECTOR)
+        .catch(() => null);
+      if (stillVisible) return true;
+    }
+    await page.waitForTimeout(250);
+  }
+  return false;
+}
+
+async function alignWorkspaceState(page) {
+  const state = await readAccountState(page);
+  const decision = accountStateSyncDecision(state);
+  if (!state.cookieValue) {
+    console.log('[workspace] no workspace cookie, keeping personal session');
+    return;
+  }
+  if (!decision.needsSync) {
+    console.log('[workspace] account state aligned');
+    return;
+  }
+
+  const encoded = encodeAccountStorageValue(state.cookieValue, state.storageValue);
+  await page.evaluate(({ key, value }) => localStorage.setItem(key, value), {
+    key: ACCOUNT_STORAGE_KEY,
+    value: encoded,
+  });
+  await page.reload({ waitUntil: 'domcontentloaded', timeout: 60000 });
+
+  if (!await waitForStableComposer(page)) {
+    const err = new Error('ChatGPT composer did not remain visible after workspace sync');
+    err.code = 'page_load_failed';
+    throw err;
+  }
+
+  const finalState = await readAccountState(page);
+  const finalDecision = accountStateSyncDecision(finalState);
+  if (!finalState.cookieValue || finalDecision.needsSync) {
+    const err = new Error('ChatGPT workspace state did not remain aligned after reload');
+    err.code = 'page_load_failed';
+    throw err;
+  }
+  console.log('[workspace] account state aligned');
 }
 
 // Remote login page
 router.get('/login', (req, res) => {
+  activateLoginFlow();
   res.send(`<!DOCTYPE html>
 <html><head>
 <meta charset="UTF-8">
@@ -35,9 +137,9 @@ router.get('/login', (req, res) => {
 </style>
 </head><body>
 <div class="toolbar">
-  <button onclick="refresh()">Refresh</button>
+  <button onclick="refresh(true)">Refresh</button>
   <button onclick="navigate('https://chatgpt.com')">ChatGPT</button>
-  <button onclick="saveSession()">Save Session</button>
+  <button id="save-session" onclick="saveSession()">Save Session</button>
   <span class="status" id="status">Click on the screenshot to interact</span>
 </div>
 <div class="input-row">
@@ -48,16 +150,41 @@ router.get('/login', (req, res) => {
   const screen = document.getElementById('screen');
   const status = document.getElementById('status');
   const typeInput = document.getElementById('type-input');
+  const saveButton = document.getElementById('save-session');
   let refreshTimer = null;
+  let refreshTimeout = null;
+  let sessionSaved = false;
 
-  function refresh() {
-    screen.src = '/login/screenshot?' + Date.now();
+  function refresh(manual = false) {
+    if (sessionSaved && !manual) return;
+    if (manual && sessionSaved) {
+      sessionSaved = false;
+      saveButton.disabled = false;
+      autoRefresh();
+    }
+    screen.src = '/login/screenshot?' + (manual ? 'manual=1&' : '') + Date.now();
     status.textContent = 'Refreshed';
+  }
+
+  function scheduleRefresh(delay) {
+    if (refreshTimeout) clearTimeout(refreshTimeout);
+    refreshTimeout = setTimeout(() => {
+      refreshTimeout = null;
+      refresh();
+    }, delay);
   }
 
   function autoRefresh() {
     if (refreshTimer) clearInterval(refreshTimer);
+    if (sessionSaved) return;
     refreshTimer = setInterval(refresh, 3000);
+  }
+
+  function stopRefresh() {
+    if (refreshTimer) clearInterval(refreshTimer);
+    if (refreshTimeout) clearTimeout(refreshTimeout);
+    refreshTimer = null;
+    refreshTimeout = null;
   }
 
   async function handleClick(e) {
@@ -72,7 +199,7 @@ router.get('/login', (req, res) => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ x, y })
     });
-    setTimeout(refresh, 500);
+    scheduleRefresh(500);
   }
 
   typeInput.addEventListener('keydown', async (e) => {
@@ -86,7 +213,7 @@ router.get('/login', (req, res) => {
         body: JSON.stringify({ text })
       });
       typeInput.value = '';
-      setTimeout(refresh, 500);
+      scheduleRefresh(500);
     }
   });
 
@@ -97,13 +224,21 @@ router.get('/login', (req, res) => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ url })
     });
-    setTimeout(refresh, 2000);
+    scheduleRefresh(2000);
   }
 
   async function saveSession() {
+    saveButton.disabled = true;
     status.textContent = 'Saving session...';
     const res = await fetch('/login/save', { method: 'POST' });
     const data = await res.json();
+    if (!res.ok) {
+      saveButton.disabled = false;
+      status.textContent = data.error || 'Could not save session';
+      return;
+    }
+    sessionSaved = true;
+    stopRefresh();
     status.textContent = data.message || 'Session saved!';
   }
 
@@ -115,7 +250,9 @@ router.get('/login', (req, res) => {
 // Screenshot
 router.get('/login/screenshot', async (req, res) => {
   try {
+    if (req.query.manual === '1') activateLoginFlow();
     const p = await getLoginPage();
+    if (!p) return loginPageUnavailable(res);
     const buffer = await p.screenshot({ type: 'jpeg', quality: 80 });
     res.set('Content-Type', 'image/jpeg');
     res.set('Cache-Control', 'no-cache');
@@ -130,6 +267,7 @@ router.post('/login/click', async (req, res) => {
   try {
     const { x, y } = req.body;
     const p = await getLoginPage();
+    if (!p) return loginPageUnavailable(res);
     await p.mouse.click(x, y);
     res.json({ ok: true });
   } catch (err) {
@@ -142,6 +280,7 @@ router.post('/login/type', async (req, res) => {
   try {
     const { text } = req.body;
     const p = await getLoginPage();
+    if (!p) return loginPageUnavailable(res);
     await p.keyboard.type(text, { delay: 30 });
     res.json({ ok: true });
   } catch (err) {
@@ -154,6 +293,7 @@ router.post('/login/key', async (req, res) => {
   try {
     const { key } = req.body;
     const p = await getLoginPage();
+    if (!p) return loginPageUnavailable(res);
     await p.keyboard.press(key);
     res.json({ ok: true });
   } catch (err) {
@@ -171,7 +311,9 @@ const LOGIN_NAV_URL = 'https://chatgpt.com';
 
 router.post('/login/navigate', async (req, res) => {
   try {
+    activateLoginFlow();
     const p = await getLoginPage();
+    if (!p) return loginPageUnavailable(res);
     await p.goto(LOGIN_NAV_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
     res.json({ ok: true, url: LOGIN_NAV_URL });
   } catch (err) {
@@ -182,7 +324,14 @@ router.post('/login/navigate', async (req, res) => {
 // Save session
 router.post('/login/save', async (req, res) => {
   try {
+    if (loginState !== 'active') return loginPageUnavailable(res);
+    const p = loginPage && !loginPage.isClosed() ? loginPage : await getLoginPage();
+    if (!p) return loginPageUnavailable(res);
+    loginState = 'saving';
+    loginGeneration++;
+    await alignWorkspaceState(p);
     await saveSession();
+    loginState = 'saved';
     // Close login page
     if (loginPage && !loginPage.isClosed()) {
       await loginPage.close();
@@ -192,8 +341,18 @@ router.post('/login/save', async (req, res) => {
     resetPage();
     res.json({ message: 'Session saved! Main page reset. You can now use the API.' });
   } catch (err) {
+    if (loginState === 'saving') {
+      loginState = 'active';
+      loginGeneration++;
+    }
     res.status(500).json({ error: err.message });
   }
 });
 
 module.exports = router;
+module.exports._test = {
+  accountStateSyncDecision,
+  alignWorkspaceState,
+  encodeAccountStorageValue,
+  parseStoredAccount,
+};

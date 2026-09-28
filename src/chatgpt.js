@@ -11,6 +11,7 @@ const {
 const { solveTurnstile } = require('./turnstile');
 const { SseAccumulator, parseSseBody, extractAssistantFromMapping, isValidConversationId } = require('./lib/conversation-read');
 const { trimConversationData } = require('./lib/conversation-trim');
+const { COMPOSER_SELECTOR, VISIBLE_COMPOSER_SELECTOR } = require('./lib/composer-selectors');
 // Liveness heartbeat for /health/live — named `liveness` to avoid clashing with the
 // local `progress` indicator object inside waitAndExtractImage.
 const { progress: liveness } = require('./progress');
@@ -189,6 +190,25 @@ function endBackendCapture() {
 
 const SINGLE_CONVERSATION_PATH_RE = /^\/backend-api\/conversation\/[0-9a-f-]+$/i;
 const CONVERSATION_POST_PATH_RE = /^\/backend-api\/(f\/)?conversation$/;
+
+function isConversationSubmitRequest(request) {
+  try {
+    return request.method().toUpperCase() === 'POST'
+      && CONVERSATION_POST_PATH_RE.test(new URL(request.url()).pathname);
+  } catch {
+    return false;
+  }
+}
+
+function isFileUploadResponse(response) {
+  try {
+    const request = response.request();
+    return request.method().toUpperCase() === 'POST'
+      && /\/backend-api\/(?:f\/)?files(?:\/|$)/i.test(new URL(response.url()).pathname);
+  } catch {
+    return false;
+  }
+}
 
 function conversationIdFromUrl(url) {
   const m = /\/c\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i.exec(url || '');
@@ -720,7 +740,7 @@ async function _createPage() {
         await p.waitForTimeout(500);
       }
 
-      const textarea = await p.$('[id="prompt-textarea"]:visible, textarea:visible');
+      const textarea = await p.$(VISIBLE_COMPOSER_SELECTOR);
       if (textarea) {
         console.log('ChatGPT loaded and ready.');
         break;
@@ -753,7 +773,7 @@ async function _createPage() {
 
     finalTitle = await p.title().catch(() => '');
     const blocked = looksLikeCloudflareChallenge(finalTitle, safeHeaders(navResponse));
-    const hasComposer = await p.$('[id="prompt-textarea"]:visible, textarea:visible').catch(() => null);
+    const hasComposer = await p.$(VISIBLE_COMPOSER_SELECTOR).catch(() => null);
     // Treat the full auth surface as "ready enough" — a logged-out page must still be
     // handed to ensureLoggedIn()/auto-login, not killed as page_load_failed. Covers
     // Log in / Sign up / Get started CTAs, the auth URL, and visible email/password fields.
@@ -1175,6 +1195,60 @@ async function composerPreflight(p) {
   await dismissModals(p);
 }
 
+function shouldForceChatMode({ present, workActive } = {}) {
+  return present === true && workActive === true;
+}
+
+function shouldUseKeyboardComposerInput({ contentEditable, preserveAttachments, hasSystemHint } = {}) {
+  return contentEditable === true || preserveAttachments === true || hasSystemHint === true;
+}
+
+async function waitForVisibleComposer(p, { attempts = 15, intervalMs = 1000 } = {}) {
+  for (let i = 0; i < attempts; i++) {
+    const composer = await p
+      .$(VISIBLE_COMPOSER_SELECTOR)
+      .catch(() => null);
+    if (composer) return composer;
+    if (i < attempts - 1) await p.waitForTimeout(intervalMs);
+  }
+  return null;
+}
+
+async function collectComposerDiagnostics(p) {
+  const rawUrl = await Promise.resolve().then(() => p.url()).catch(() => '');
+  let url = rawUrl;
+  try {
+    const parsed = new URL(rawUrl);
+    parsed.search = '';
+    parsed.hash = '';
+    url = parsed.toString();
+  } catch {}
+
+  const title = String(await p.title().catch(() => '')).replace(/\s+/g, ' ').slice(0, 160);
+  const surfaces = await p.evaluate(() => {
+    const text = (el) => (el && (el.innerText || el.textContent) || '').replace(/\s+/g, ' ').trim().toLowerCase();
+    const visible = (el) => {
+      const rect = el.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0;
+    };
+    const controls = Array.from(document.querySelectorAll(
+      'button, [role="button"], [role="tab"], [role="checkbox"]',
+    )).filter(visible);
+    const labels = new Set(controls.map(text));
+    const authSurface = Array.from(document.querySelectorAll(
+      'button, a, input[type="password"], input[name="username"], input[type="email"]',
+    )).some((el) => visible(el) && /log in|sign up|get started|password|username|email/i.test(
+      text(el) || el.getAttribute('placeholder') || '',
+    ));
+    return {
+      chatWorkSwitcher: labels.has('chat') && labels.has('work'),
+      authSurface,
+    };
+  }).catch(() => ({ chatWorkSwitcher: false, authSurface: false }));
+
+  return { url, title, ...surfaces };
+}
+
 // 2026-07 UI: a "Chat / Work" segmented switcher sits above the thread (labels are English
 // even in the RU UI). The Work surface is a different product: agentic task flows, its
 // composer defaults to the TOP effort tier and its pill renders "<model> <level>"
@@ -1197,9 +1271,9 @@ async function ensureChatMode(p) {
         ['active', 'checked', 'on'].includes(el.getAttribute('data-state') || '');
       return { present: true, chatActive: isActive(chat), workActive: isActive(work) };
     });
-    if (!seg || !seg.present) return;
-    if (seg.chatActive && !seg.workActive) return;
-    // Work active — or the active marker is unreadable. Clicking Chat is idempotent.
+    if (!shouldForceChatMode(seg)) return;
+    // Only an affirmative Work marker justifies a switch. An unreadable marker is ambiguous;
+    // clicking Chat in that state can trigger an unnecessary SPA transition/rerender.
     await p.getByRole('button', { name: /^chat$/i }).first().click({ timeout: 1200 }).catch(() => {});
     await p.waitForTimeout(600).catch(() => {});
     // Verify the switch actually landed on Chat: the Work composer pill carries a model
@@ -1221,7 +1295,7 @@ async function ensureChatMode(p) {
   }
 }
 
-async function ensureNewChat(p) {
+async function ensureNewChat(p, { composerAttempts = 15, composerIntervalMs = 1000 } = {}) {
   const url = p.url();
   if (url !== `${CHATGPT_URL}/` && url !== CHATGPT_URL) {
     await p.goto(CHATGPT_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
@@ -1229,10 +1303,20 @@ async function ensureNewChat(p) {
 
   await recoverContentFailed(p);
 
-  for (let i = 0; i < 15; i++) {
-    const textarea = await p.$('[id="prompt-textarea"]:visible, textarea:visible');
-    if (textarea) break;
-    await p.waitForTimeout(1000);
+  const composerFound = await waitForVisibleComposer(p, {
+    attempts: composerAttempts,
+    intervalMs: composerIntervalMs,
+  });
+  if (!composerFound) {
+    const diagnostics = await collectComposerDiagnostics(p);
+    console.log(
+      `[ui-adapter] composer not found after polling url="${diagnostics.url}" ` +
+      `title="${diagnostics.title}" chat_work_switcher=${diagnostics.chatWorkSwitcher} ` +
+      `auth_surface=${diagnostics.authSurface}`,
+    );
+    const err = new Error('ChatGPT composer did not appear');
+    err.code = 'page_load_failed';
+    throw err;
   }
 
   await composerPreflight(p);
@@ -1260,7 +1344,7 @@ async function openConversation(p, conversationId) {
 
   let composer = null;
   for (let i = 0; i < 15; i++) {
-    composer = await p.$('[id="prompt-textarea"]:visible, textarea:visible');
+    composer = await p.$(VISIBLE_COMPOSER_SELECTOR);
     if (composer) break;
     // A missing/foreign conversation bounces back to the new-chat URL or shows an
     // error state — poll a bit, then fail below if the composer never appeared.
@@ -1289,8 +1373,19 @@ async function openConversation(p, conversationId) {
   await removePendingAttachments(p);
 }
 
-// Count visible "Remove …" chips that ChatGPT renders for each pending attachment
-// in the composer. Covers Remove file/attachment/image and Russian "Удалить".
+const PREFERRED_FILE_INPUT_SELECTOR = [
+  '#upload-photos',
+  'input[type="file"][aria-label="Attach photos"]',
+].join(', ');
+
+const FALLBACK_FILE_INPUT_SELECTOR = [
+  'input[type="file"][aria-label="Attach photos or videos"]',
+  'input[type="file"]:not(#upload-camera)',
+].join(', ');
+
+// Count visible attachment previews that ChatGPT renders in the composer. The Edu
+// workspace no longer uses the old fixed #upload-photos id or always renders a
+// "Remove …" button, so preview test ids are part of the fallback contract.
 async function countAttachmentChips(p) {
   return await p.evaluate(() => {
     const sels = [
@@ -1298,11 +1393,50 @@ async function countAttachmentChips(p) {
       'button[aria-label^="Remove attachment"]',
       'button[aria-label^="Remove image"]',
       'button[aria-label^="Удалить"]',
+      '[data-testid="attachment-preview"]',
+      '[data-testid="file-preview"]',
+      '[data-testid*="attachment-preview"]',
+      '[data-testid*="file-preview"]',
+      '[data-testid*="upload-preview"]',
     ];
-    let count = 0;
-    for (const sel of sels) count += document.querySelectorAll(sel).length;
-    return count;
+    const visible = (el) => {
+      if (el.closest && el.closest('[data-message-author-role="user"]')) return false;
+      return el.getClientRects().length > 0;
+    };
+    const matches = new Set();
+    for (const sel of sels) {
+      document.querySelectorAll(sel).forEach((el) => {
+        if (visible(el)) matches.add(el);
+      });
+    }
+    return matches.size;
   }).catch(() => 0);
+}
+
+async function collectUploadDiagnostics(p, fileInput) {
+  const dom = await p.evaluate(() => {
+    const previews = Array.from(document.querySelectorAll(
+      'button[aria-label^="Remove file"], button[aria-label^="Remove attachment"], '
+        + 'button[aria-label^="Remove image"], [data-testid*="attachment-preview"], '
+        + '[data-testid*="file-preview"], [data-testid*="upload-preview"]',
+    )).filter((el) => el.getClientRects().length > 0);
+    return {
+      inputs: Array.from(document.querySelectorAll('input[type="file"]')).map((el) => ({
+        id: el.id,
+        aria: el.getAttribute('aria-label'),
+        accept: el.getAttribute('accept'),
+        files: el.files ? el.files.length : 0,
+      })),
+      visiblePreviewCount: previews.length,
+    };
+  }).catch(() => ({ inputs: [], visiblePreviewCount: 0 }));
+  const selected = await fileInput.evaluate((el) => ({
+    id: el.id,
+    aria: el.getAttribute('aria-label'),
+    accept: el.getAttribute('accept'),
+    files: el.files ? el.files.length : 0,
+  })).catch(() => null);
+  return { ...dom, selected };
 }
 
 // Upload one or more images to the chat via the native <input type="file"> element.
@@ -1328,18 +1462,25 @@ async function uploadImage(p, imageInputs) {
   // Retries only trigger when the chip count is truly stuck below files.length.
   const waitIters = Math.min(30 + 10 * (files.length - 1), 60);
 
-  // Prefer the dedicated photos input (id="upload-photos") over the camera one.
-  // React on this input ignores Playwright's setInputFiles alone — we must
-  // dispatch input/change events ourselves to wake the composer.
-  const fileInput = p.locator('#upload-photos, input[type="file"]:not(#upload-camera)').first();
+  // Prefer the dedicated photos input. Edu uses generated ids and exposes the
+  // stable accessible labels "Attach photos" / "Attach photos or videos".
+  // React on this input ignores Playwright's setInputFiles alone — dispatch
+  // input/change events ourselves to wake the composer.
+  const preferredFileInput = p.locator(PREFERRED_FILE_INPUT_SELECTOR).first();
+  const fileInput = (await preferredFileInput.count()) > 0
+    ? preferredFileInput
+    : p.locator(FALLBACK_FILE_INPUT_SELECTOR).first();
   await fileInput.waitFor({ state: 'attached', timeout: 10000 });
 
-  let lastChipCount = 0;
+  let lastConfirmedCount = 0;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     if (attempt > 1) {
       // Before wiping anything, double-check that the previous attempt didn't get
       // a late preview chip — if it did, accept success instead of clobbering it.
-      const lateCount = await countAttachmentChips(p);
+      const lateCount = Math.max(
+        await countAttachmentChips(p),
+        await fileInput.evaluate((el) => el.files ? el.files.length : 0).catch(() => 0),
+      );
       if (lateCount >= files.length) {
         console.log(`[upload] Attempt ${attempt - 1}: preview confirmed late (${lateCount}/${files.length} chips), skipping retry`);
         await p.waitForTimeout(500 + 200 * Math.max(0, files.length - 1));
@@ -1360,6 +1501,13 @@ async function uploadImage(p, imageInputs) {
     }
 
     console.log(`[upload] Attempt ${attempt}/${maxAttempts}: uploading ${files.length} file(s) via setInputFiles (${totalBytes} bytes total)...`);
+    let uploadResponseStatus = null;
+    const uploadResponsePromise = typeof p.waitForResponse === 'function'
+      ? p.waitForResponse(isFileUploadResponse, { timeout: waitIters * 1000 }).catch(() => null)
+      : Promise.resolve(null);
+    uploadResponsePromise.then((response) => {
+      if (response) uploadResponseStatus = response.status();
+    }).catch(() => {});
     await fileInput.setInputFiles(files);
     await fileInput.evaluate((el) => {
       el.dispatchEvent(new Event('input', { bubbles: true }));
@@ -1367,31 +1515,47 @@ async function uploadImage(p, imageInputs) {
     }).catch(() => {});
 
     let confirmedThisAttempt = 0;
+    let lastPreviewCount = 0;
+    let lastInputFileCount = 0;
     for (let i = 0; i < waitIters; i++) {
       const chipCount = await countAttachmentChips(p);
-      if (chipCount > confirmedThisAttempt) confirmedThisAttempt = chipCount;
-      if (chipCount >= files.length) break;
+      const inputFileCount = await fileInput
+        .evaluate((el) => el.files ? el.files.length : 0)
+        .catch(() => 0);
+      lastPreviewCount = Math.max(lastPreviewCount, chipCount);
+      lastInputFileCount = Math.max(lastInputFileCount, inputFileCount);
+      confirmedThisAttempt = Math.max(confirmedThisAttempt, chipCount, inputFileCount);
+      if (confirmedThisAttempt >= files.length || (uploadResponseStatus >= 200 && uploadResponseStatus < 300)) break;
       await p.waitForTimeout(1000);
     }
 
-    lastChipCount = confirmedThisAttempt;
-    if (confirmedThisAttempt >= files.length) {
-      console.log(`[upload] Attempt ${attempt}: preview confirmed (${confirmedThisAttempt}/${files.length} chips)`);
+    const uploadAccepted = uploadResponseStatus >= 200 && uploadResponseStatus < 300;
+    lastConfirmedCount = Math.max(confirmedThisAttempt, uploadAccepted ? files.length : 0);
+    if (confirmedThisAttempt >= files.length || uploadAccepted) {
+      console.log(
+        `[upload] Attempt ${attempt}: attachment confirmed (${lastConfirmedCount}/${files.length}; `
+        + `preview=${lastPreviewCount}, input=${lastInputFileCount}, `
+        + `upload_status=${uploadResponseStatus || 'not-observed'})`,
+      );
       // Small settle — ChatGPT React state can flicker between setInputFiles and visible chip
       await p.waitForTimeout(500 + 200 * Math.max(0, files.length - 1));
       await p.waitForTimeout(1000);
-      return confirmedThisAttempt;
+      return lastConfirmedCount;
     }
 
     console.log(`[upload] Attempt ${attempt}: only ${confirmedThisAttempt}/${files.length} chips visible after ~${waitIters}s`);
   }
 
-  console.log(`[upload] All ${maxAttempts} attempts exhausted — only ${lastChipCount}/${files.length} chips visible`);
-  return lastChipCount;
+  const diagnostics = await collectUploadDiagnostics(p, fileInput);
+  console.log(
+    `[upload] All ${maxAttempts} attempts exhausted — only ${lastConfirmedCount}/${files.length} `
+      + `attachment(s) confirmed; diagnostics=${JSON.stringify(diagnostics)}`,
+  );
+  return lastConfirmedCount;
 }
 
 async function clearComposer(p) {
-  const textareaLocator = p.locator('#prompt-textarea');
+  const textareaLocator = p.locator(VISIBLE_COMPOSER_SELECTOR);
   const count = await textareaLocator.count();
   if (!count) return;
 
@@ -1409,9 +1573,19 @@ async function removePendingAttachments(p) {
       'button[aria-label^="Remove attachment"]',
       'button[aria-label^="Remove image"]',
       'button[aria-label^="Удалить"]',
+      'button[aria-label*="Remove file" i]',
+      'button[aria-label*="Remove attachment" i]',
+      'button[aria-label*="Remove image" i]',
+      '[data-testid*="attachment-remove"]',
+      '[data-testid*="file-remove"]',
     ];
+    const seen = new Set();
     for (const selector of selectors) {
-      document.querySelectorAll(selector).forEach(btn => btn.click());
+      document.querySelectorAll(selector).forEach((btn) => {
+        if (seen.has(btn)) return;
+        seen.add(btn);
+        btn.click();
+      });
     }
   }).catch(() => {});
 }
@@ -2327,22 +2501,37 @@ async function typeComposerText(p, text, options = {}) {
 async function typeAndSubmit(p, text, preserveAttachments = false, onSubmitted = null) {
   console.log('Typing prompt...');
   await dismissModals(p);
-  const textareaLocator = p.locator('#prompt-textarea');
-  await textareaLocator.first().waitFor({ state: 'visible', timeout: 30000 });
+  const textareaLocator = p.locator(VISIBLE_COMPOSER_SELECTOR);
+  const composer = textareaLocator.first();
+  await composer.waitFor({ state: 'visible', timeout: 30000 });
 
   // fill() REPLACES the ProseMirror doc — it wipes attachments AND composer system-hint
   // tokens (the 2026-07 web-search pill lives INSIDE the editor). Preserve both by typing.
-  const hasSystemHint = await p.locator('#prompt-textarea [data-system-hint-type]').count()
+  const hasSystemHint = await composer.locator('[data-system-hint-type]').count()
     .then((c) => c > 0).catch(() => false);
+  const contentEditable = await composer.evaluate((el) => (
+    el.isContentEditable || el.getAttribute('contenteditable') === 'true'
+  )).catch(() => false);
+  const useKeyboardInput = shouldUseKeyboardComposerInput({
+    contentEditable,
+    preserveAttachments,
+    hasSystemHint,
+  });
   const caretEndKey = process.platform === 'darwin' ? 'Meta+ArrowDown' : 'Control+End';
-  if (preserveAttachments || hasSystemHint) {
-    console.log(`Using keyboard type to preserve ${hasSystemHint ? 'composer token' : 'attachments'}...`);
-    await textareaLocator.first().click();
-    await p.keyboard.press(caretEndKey).catch(() => {});
+  const selectAllKey = process.platform === 'darwin' ? 'Meta+a' : 'Control+a';
+  if (useKeyboardInput) {
+    console.log(`Using keyboard input for ${contentEditable ? 'contenteditable composer' : hasSystemHint ? 'composer token' : 'attachments'}...`);
+    await composer.click();
+    if (preserveAttachments || hasSystemHint) {
+      await p.keyboard.press(caretEndKey).catch(() => {});
+    } else {
+      await p.keyboard.press(selectAllKey);
+      await p.keyboard.press('Backspace');
+    }
     await p.waitForTimeout(300);
     await typeComposerText(p, text, { delay: 10 });
   } else {
-    await textareaLocator.first().fill(text);
+    await composer.fill(text);
   }
   await p.waitForTimeout(500);
 
@@ -2352,13 +2541,18 @@ async function typeAndSubmit(p, text, preserveAttachments = false, onSubmitted =
   // without separators, so multi-line probes would false-negative.
   const normText = (s) => (s || '').replace(/\s+/g, ' ').trim();
   const probe = normText((text || '').split('\n')[0]).slice(0, 30);
-  const content = await textareaLocator.first().textContent();
+  const content = await composer.textContent();
   console.log('Prompt filled:', content ? content.substring(0, 50) + '...' : '(empty)');
 
   if (!content || (probe && !normText(content).includes(probe))) {
     console.log('Fill failed, trying pressSequentially...');
-    await textareaLocator.first().click();
-    await p.keyboard.press(caretEndKey).catch(() => {});
+    await composer.click();
+    if (!preserveAttachments && !hasSystemHint) {
+      await p.keyboard.press(selectAllKey).catch(() => {});
+      await p.keyboard.press('Backspace').catch(() => {});
+    } else {
+      await p.keyboard.press(caretEndKey).catch(() => {});
+    }
     await p.waitForTimeout(300);
     await typeComposerText(p, text, { delay: 10 });
     await p.waitForTimeout(500);
@@ -2369,9 +2563,18 @@ async function typeAndSubmit(p, text, preserveAttachments = false, onSubmitted =
 
   // Baseline BEFORE submitting — verification below works on deltas: a stop-button left
   // over from a previous turn or a composer rerender must not count as "submitted".
-  const countUserTurns = () => p.evaluate(
-    () => document.querySelectorAll('[data-message-author-role="user"]').length
-  ).catch(() => -1);
+  const countUserTurns = () => p.evaluate(() => {
+    const explicit = document.querySelectorAll('[data-message-author-role="user"]');
+    if (explicit.length) return explicit.length;
+    const testIdTurns = document.querySelectorAll(
+      '[data-testid*="conversation-turn-user" i], [data-testid*="user-message" i]',
+    );
+    if (testIdTurns.length) return testIdTurns.length;
+    return Array.from(document.querySelectorAll('h1, h2, h3, h4, [role="heading"]'))
+      .filter((el) => /^(you said|bạn đã nói)\s*:?[\s.]*$/i.test(
+        (el.innerText || el.textContent || '').trim(),
+      )).length;
+  }).catch(() => -1);
   const userTurnsBefore = await countUserTurns();
   const STOP_BTN = 'button[data-testid="stop-button"], button[aria-label="Stop generating"], button[aria-label="Остановить"]';
   // Baseline the stop-button too: a leftover one from the previous turn must not
@@ -2381,8 +2584,13 @@ async function typeAndSubmit(p, text, preserveAttachments = false, onSubmitted =
   // Use locator to avoid "element detached from DOM" errors
   // Image 2.0 UI may rename aria-label — keep multiple fallbacks
   const sendLocator = p.locator(
-    'button[data-testid="send-button"], #composer-submit-button, button[aria-label="Send prompt"], button[aria-label^="Отправить"]'
+    'button[data-testid="send-button"], button[data-testid*="send" i], #composer-submit-button, '
+      + 'button[aria-label="Send"], button[aria-label="Send prompt"], '
+      + 'button[aria-label*="Send message" i], button[aria-label^="Отправить"]'
   );
+  const conversationRequestPromise = typeof p.waitForRequest === 'function'
+    ? p.waitForRequest(isConversationSubmitRequest, { timeout: 12000 }).catch(() => null)
+    : Promise.resolve(null);
   try {
     await sendLocator.first().waitFor({ state: 'visible', timeout: 5000 });
     console.log('Send button found. Clicking...');
@@ -2408,15 +2616,24 @@ async function typeAndSubmit(p, text, preserveAttachments = false, onSubmitted =
   // instead of waiting the full response budget on a message that was never sent.
   const submitDeadline = Date.now() + 12000;
   let submitted = false;
+  let conversationRequestSeen = false;
+  conversationRequestPromise.then((request) => {
+    conversationRequestSeen = !!request;
+  }).catch(() => {});
   while (Date.now() < submitDeadline) {
+    if (conversationRequestSeen) { submitted = true; break; }
     const turnsNow = await countUserTurns();
     if (userTurnsBefore >= 0 && turnsNow > userTurnsBefore) { submitted = true; break; }
-    const composerNow = normText(await textareaLocator.first().textContent().catch(() => ''));
+    const composerNow = normText(await composer.textContent().catch(() => ''));
     const probeGone = probe && !composerNow.includes(probe);
     if (probeGone) {
       const stopNow = !!(await p.$(STOP_BTN).catch(() => null));
       const stopAppeared = stopNow && !stopBefore;
-      if (stopAppeared || (userTurnsBefore >= 0 && (await countUserTurns()) > userTurnsBefore)) { submitted = true; break; }
+      if (stopAppeared || conversationRequestSeen
+        || (userTurnsBefore >= 0 && (await countUserTurns()) > userTurnsBefore)) {
+        submitted = true;
+        break;
+      }
     }
     await p.waitForTimeout(500).catch(() => {});
   }
@@ -2431,7 +2648,7 @@ async function typeAndSubmit(p, text, preserveAttachments = false, onSubmitted =
     if (uiError) err.modelMessage = uiError;
     throw err;
   }
-  console.log('Prompt submitted (confirmed).');
+  console.log(`Prompt submitted (confirmed${conversationRequestSeen ? ' by backend conversation request' : ''}).`);
   // Signal confirmed-send NOW, before the settle wait — a failure during the wait below must
   // count as "already submitted" so the caller does not retry and resubmit the prompt.
   if (onSubmitted) { try { onSubmitted(); } catch {} }
@@ -2566,6 +2783,9 @@ async function closeOpenMenus(p) {
 // The tier control is a slider (2026-08). Both shapes it can take are covered: a native
 // `<input type="range">` and an ARIA widget (`role="slider"`, e.g. a Radix thumb).
 const SLIDER_SEL = 'input[type="range"], [role="slider"]';
+// The current ChatGPT composer uses this accessible name for the button that opens the
+// thinking-effort slider. It is intentionally kept alongside the legacy pill selectors.
+const INTELLIGENCE_PILL_SELECTOR = '[aria-label*="Select ChatGPT model" i]';
 
 // Read the tier slider's position. Returns null when no slider is visible — which is also how
 // "the popover is not open" is detected, since the track only exists while it is.
@@ -2647,10 +2867,32 @@ async function readPopoverShape(p) {
   return { slider, ...rows };
 }
 
+async function hasVisibleThinkingSlider(p) {
+  return await p.evaluate((sel) => Array.from(document.querySelectorAll(sel)).some((el) => {
+    const rect = el.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return false;
+    const min = Number(el.getAttribute('aria-valuemin'));
+    const max = Number(el.getAttribute('aria-valuemax'));
+    return Number.isFinite(min) && Number.isFinite(max) && max > min;
+  }), SLIDER_SEL).catch(() => false);
+}
+
 async function intelligencePopoverOpen(p) {
   const shape = await readPopoverShape(p);
-  return (!!shape.slider && shape.slider.positions >= 2)
-    || shape.advanced || shape.effort || shape.levelItems >= 2;
+  if (shape.slider && shape.slider.positions >= 2) return true;
+  // Some Radix slider thumbs are exposed as aria-hidden presentation nodes while the
+  // popover is open. The direct DOM check keeps detection aligned with the visible track
+  // without treating unrelated menus as the thinking control.
+  if (await hasVisibleThinkingSlider(p)) return true;
+  return shape.advanced || shape.effort || shape.levelItems >= 2;
+}
+
+async function waitForIntelligencePopover(p, { attempts = 8, intervalMs = 200 } = {}) {
+  for (let i = 0; i < attempts; i++) {
+    if (await intelligencePopoverOpen(p)) return true;
+    if (i < attempts - 1) await p.waitForTimeout(intervalMs).catch(() => {});
+  }
+  return false;
 }
 
 // Dump whatever the popover actually contains. This runs only on the failure path, and it
@@ -2688,15 +2930,41 @@ async function dumpIntelligencePopover(p) {
   }, SLIDER_SEL).catch((e) => ({ error: String((e && e.message) || e) }));
 }
 
+// The Edu composer renders the model-picker trigger with an accessible label, but its
+// framework wrapper can intermittently reject locator clicks while the composer is settling.
+// Resolve the visible DOM node to coordinates and use the same real pointer path as a user.
+// Personal does not expose this label, so this fallback is Edu-specific by construction.
+async function clickVisibleIntelligenceTrigger(p) {
+  const point = await p.evaluate(() => {
+    const visible = (el) => {
+      const rect = el.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0;
+    };
+    const candidates = Array.from(document.querySelectorAll('button, [role="button"]'))
+      .filter(visible)
+      .filter((el) => /^select chatgpt model$/i.test((el.getAttribute('aria-label') || '').trim()));
+    const target = candidates[candidates.length - 1];
+    if (!target) return null;
+    const rect = target.getBoundingClientRect();
+    return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+  }).catch(() => null);
+  if (!point || !p.mouse || typeof p.mouse.click !== 'function') return false;
+  await p.mouse.click(point.x, point.y);
+  return true;
+}
+
 async function openIntelligenceMenu(p) {
   // The composer shows a pill button whose text is the CURRENT level; activating it opens the
   // tier popover. It reacts to REAL pointer events only — a synthetic in-page element.click()
-  // does NOT open it. Primary trigger: the composer pill by its stable class (scoped, cannot
-  // hit sidebar buttons); text-based locators kept as fallback. Each attempt: close stray
-  // menus → activate (click / Enter / Space) → verify the TRACK specifically appeared (not
-  // just any popover).
+  // does NOT open it. The current UI exposes this pill as a button labelled "Select ChatGPT
+  // model" even though it opens the thinking-effort slider; keep the older class/text triggers
+  // after it for Personal and older ChatGPT surfaces. Each attempt: close stray menus →
+  // activate (click / Enter / Space) → verify the TRACK specifically appeared (not just any
+  // popover).
   const pillText = /(instant|medium|high|extra high|very high|pro расширенн|pro extended|\bpro\b|мгновенн|средн|высок|очень высок)/i;
   const triggers = [
+    p.getByRole('button', { name: /^select chatgpt model$/i }).last(),
+    p.locator(INTELLIGENCE_PILL_SELECTOR).last(),
     p.locator('.__composer-pill').last(),
     p.locator('button').filter({ hasText: pillText }).last(),
     p.getByRole('button', { name: pillText }).last(),
@@ -2706,14 +2974,39 @@ async function openIntelligenceMenu(p) {
     async (loc) => { await loc.focus(); await p.keyboard.press('Enter'); },
     async (loc) => { await loc.focus(); await p.keyboard.press('Space'); },
   ];
-  for (const loc of triggers) {
+  const currentTriggers = [
+    p.getByRole('button', { name: /^select chatgpt model$/i }).last(),
+    p.locator(INTELLIGENCE_PILL_SELECTOR).last(),
+  ];
+  await closeOpenMenus(p);
+  if (await clickVisibleIntelligenceTrigger(p)) {
+    await p.waitForTimeout(600).catch(() => {});
+    return { ok: true, label: 'current intelligence trigger mouse click' };
+  }
+  for (const loc of currentTriggers) {
+    if (!await loc.count().catch(() => 0)) continue;
+    try {
+      await closeOpenMenus(p);
+      await loc.click({ timeout: 1500, force: true });
+      await p.waitForTimeout(600).catch(() => {});
+      return { ok: true, label: 'current intelligence trigger' };
+    } catch {}
+  }
+  for (const [index, loc] of triggers.entries()) {
     if (!await loc.isVisible({ timeout: 400 }).catch(() => false)) continue;
     for (const activate of activations) {
       try {
         await closeOpenMenus(p); // a stray open popover swallows the next activation
         await activate(loc);
-        await p.waitForTimeout(400);
-        if (await intelligencePopoverOpen(p)) {
+        if (index < 2) {
+          // The current model-picker button is the thinking slider trigger, but Patchright
+          // can observe its Radix popup one render later than the native click. Let the slider
+          // adapter perform the authoritative read/verification instead of rejecting a real
+          // activation during this transient window.
+          await p.waitForTimeout(600).catch(() => {});
+          return { ok: true, label: 'current intelligence trigger' };
+        }
+        if (await waitForIntelligencePopover(p)) {
           return { ok: true, label: 'intelligence pill' };
         }
       } catch {}
@@ -2723,8 +3016,27 @@ async function openIntelligenceMenu(p) {
   // once with the primary trigger first: the ladder above ends with an Escape-then-activate
   // cycle, so by now the popover is as likely closed as open and dumping would show nothing.
   await closeOpenMenus(p);
-  await p.locator('.__composer-pill').last().click({ timeout: 1500 }).catch(() => {});
-  await p.waitForTimeout(400).catch(() => {});
+  const currentTrigger = p.getByRole('button', { name: /^select chatgpt model$/i }).last();
+  if (await currentTrigger.isVisible({ timeout: 400 }).catch(() => false)) {
+    await currentTrigger.click({ timeout: 1500 }).catch(() => {});
+    if (await waitForIntelligencePopover(p)) {
+      return { ok: true, label: 'intelligence pill aria-label' };
+    }
+  }
+  const currentCssTrigger = p.locator(INTELLIGENCE_PILL_SELECTOR).last();
+  if (await currentCssTrigger.isVisible({ timeout: 400 }).catch(() => false)) {
+    await currentCssTrigger.click({ timeout: 1500 }).catch(() => {});
+    if (await waitForIntelligencePopover(p)) {
+      return { ok: true, label: 'intelligence pill css selector' };
+    }
+  }
+  const legacyTrigger = p.locator('.__composer-pill').last();
+  if (await legacyTrigger.isVisible({ timeout: 400 }).catch(() => false)) {
+    await legacyTrigger.click({ timeout: 1500 }).catch(() => {});
+    if (await waitForIntelligencePopover(p)) {
+      return { ok: true, label: 'legacy intelligence pill' };
+    }
+  }
   const labels = await p.evaluate(() => {
     const norm = (s) => (s || '').toLowerCase().replace(/\s+/g, ' ').trim();
     return Array.from(document.querySelectorAll('button, [role="button"]'))
@@ -3985,6 +4297,15 @@ module.exports = {
   // stayed green. A page double is enough — the throw happens long before any image work.
   _test: {
     typeComposerText,
+    fileInputSelector: `${PREFERRED_FILE_INPUT_SELECTOR}, ${FALLBACK_FILE_INPUT_SELECTOR}`,
+    isConversationSubmitRequest,
+    isFileUploadResponse,
+    intelligencePillSelector: INTELLIGENCE_PILL_SELECTOR,
+    shouldForceChatMode,
+    shouldUseKeyboardComposerInput,
+    ensureChatMode,
+    waitForVisibleComposer,
+    ensureNewChat,
     imageOutcomePredicate,
     setThinkingMode,
     waitAndExtractImage,
