@@ -2487,10 +2487,15 @@ async function typeComposerText(p, text, options = {}) {
     .replace(/\r\n/g, '\n')
     .replace(/\r/g, '\n');
   const parts = normalized.split('\n');
+  const fallbackOptions = { ...options, delay: 0 };
 
   for (let i = 0; i < parts.length; i++) {
     if (parts[i]) {
-      await p.keyboard.type(parts[i], options);
+      try {
+        await p.keyboard.insertText(parts[i]);
+      } catch {
+        await p.keyboard.type(parts[i], fallbackOptions);
+      }
     }
     if (i < parts.length - 1) {
       await p.keyboard.press('Shift+Enter');
@@ -2529,7 +2534,7 @@ async function typeAndSubmit(p, text, preserveAttachments = false, onSubmitted =
       await p.keyboard.press('Backspace');
     }
     await p.waitForTimeout(300);
-    await typeComposerText(p, text, { delay: 10 });
+    await typeComposerText(p, text);
   } else {
     await composer.fill(text);
   }
@@ -2554,7 +2559,7 @@ async function typeAndSubmit(p, text, preserveAttachments = false, onSubmitted =
       await p.keyboard.press(caretEndKey).catch(() => {});
     }
     await p.waitForTimeout(300);
-    await typeComposerText(p, text, { delay: 10 });
+    await typeComposerText(p, text);
     await p.waitForTimeout(500);
   }
 
